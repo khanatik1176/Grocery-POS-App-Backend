@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+.env
+.DS_Store
+*.log
+staticfiles/
+.neon
+node_modules/
+media/
