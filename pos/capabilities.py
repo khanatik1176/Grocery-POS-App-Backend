@@ -2,6 +2,7 @@ CAPABILITIES = (
     ("inventory.view", "Inventory", "View products, quantities, and prices"),
     ("inventory.receive", "Inventory", "Add stock by barcode, QR, or manual entry"),
     ("inventory.locations", "Inventory", "Configure warehouses and shops"),
+    ("inventory.transfer", "Inventory", "Move stock between warehouse and shops"),
     ("inventory.bundles", "Inventory", "Create combo bundles"),
     ("inventory.preorder", "Inventory", "Change pre-order alerts"),
     ("sales.sell", "Sales", "Scan, search, and complete sales"),

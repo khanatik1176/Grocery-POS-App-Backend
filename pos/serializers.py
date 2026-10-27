@@ -19,6 +19,13 @@ class ReceiveSerializer(serializers.Serializer):
     image_base64 = serializers.CharField(required=False, allow_blank=True)
 
 
+class TransferSerializer(serializers.Serializer):
+    barcode = serializers.CharField()
+    from_location = serializers.CharField()
+    to_location = serializers.CharField()
+    quantity = serializers.IntegerField(min_value=1)
+
+
 class PreorderSerializer(serializers.Serializer):
     reorder_level = serializers.IntegerField(min_value=0, allow_null=True, required=False)
     lead_days = serializers.IntegerField(min_value=0, allow_null=True, required=False)
@@ -72,7 +79,7 @@ class QuoteSerializer(serializers.Serializer):
 
 
 class PaymentSerializer(serializers.Serializer):
-    method = serializers.ChoiceField(choices=["cash", "bkash", "nagad", "rocket"])
+    method = serializers.ChoiceField(choices=["cash", "bkash", "nagad", "rocket", "card"])
     amount_taken = serializers.DecimalField(max_digits=10, decimal_places=2)
     txn_number = serializers.CharField(required=False, allow_blank=True)
 
@@ -82,7 +89,11 @@ class CheckoutSerializer(serializers.Serializer):
     lines = SaleLineSerializer(many=True)
     payment = PaymentSerializer()
     customer_phone = serializers.CharField(required=False, allow_blank=True)
-    customer_email = serializers.EmailField(required=False, allow_blank=True)
+    customer_email = serializers.EmailField(
+        required=False,
+        allow_blank=True,
+        error_messages={"invalid": "Enter a full email address, like name@example.com, or leave it empty."},
+    )
 
 
 class SmsSerializer(serializers.Serializer):
@@ -112,6 +123,33 @@ class LoanSerializer(serializers.Serializer):
 
 class CollectSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+
+
+class ProductPageQuerySerializer(serializers.Serializer):
+    q = serializers.CharField(required=False, allow_blank=True, default="")
+    filter = serializers.ChoiceField(choices=["", "low", "expiring", "combo"], required=False, default="")
+    location = serializers.CharField(required=False, allow_blank=True, default="")
+    page = serializers.IntegerField(required=False, min_value=1, default=1)
+
+
+class PageQuerySerializer(serializers.Serializer):
+    page = serializers.IntegerField(required=False, min_value=1, default=1)
+
+
+class PeriodQuerySerializer(serializers.Serializer):
+    preset = serializers.ChoiceField(
+        choices=["today", "date", "week", "week_range", "days30", "month", "range"],
+        default="today",
+    )
+    date = serializers.DateField(required=False)
+    start = serializers.DateField(required=False)
+    end = serializers.DateField(required=False)
+
+
+class SaleHistoryQuerySerializer(PeriodQuerySerializer):
+    method = serializers.ChoiceField(choices=["", "cash", "card", "bkash", "nagad", "rocket"], required=False, default="")
+    q = serializers.CharField(required=False, allow_blank=True, default="")
+    page = serializers.IntegerField(required=False, min_value=1, default=1)
 
 
 class SummaryQuerySerializer(serializers.Serializer):

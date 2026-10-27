@@ -76,6 +76,11 @@ class StockLot(models.Model):
 
 
 class StockMove(models.Model):
+    kind = models.CharField(
+        max_length=16,
+        default="receive",
+        choices=[("receive", "Receive"), ("sale", "Sale"), ("transfer", "Transfer")],
+    )
     sale = models.ForeignKey(
         "Sale",
         null=True,

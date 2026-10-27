@@ -19,13 +19,18 @@ from .serializers import (
     LoanSerializer,
     LocationSerializer,
     PartnerSerializer,
+    PageQuerySerializer,
+    PeriodQuerySerializer,
+    ProductPageQuerySerializer,
     PreorderDefaultsSerializer,
     PreorderSerializer,
     QuoteSerializer,
+    SaleHistoryQuerySerializer,
     ReceiveSerializer,
     SmsSerializer,
     StoreSettingsSerializer,
     SummaryQuerySerializer,
+    TransferSerializer,
     VendorPaymentSerializer,
 )
 from .services import (
@@ -46,6 +51,7 @@ from .services import (
     plan_payload,
     preorder_defaults,
     product_detail,
+    product_page,
     product_rows,
     receipt_html,
     receive_stock,
@@ -57,6 +63,11 @@ from .services import (
     update_preorder_defaults,
     update_store_settings,
     build_plan,
+    sale_detail,
+    sale_history,
+    transfer_stock,
+    vendor_ledger,
+    vendor_names,
 )
 from django.contrib.auth import get_user_model
 
@@ -71,7 +82,12 @@ class ProductListView(PosView):
     @extend_schema(tags=["inventory"], operation_id="inventory_products_list")
     def get(self, request):
         require(request.user, "inventory.view")
-        return Response(product_rows(request.query_params.get("q", "")))
+        # Without ?page the full list is returned, as pickers (combos, transfers) expect.
+        if "page" not in request.query_params:
+            return Response(product_rows(request.query_params.get("q", "")))
+        serializer = ProductPageQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        return Response(product_page(serializer.validated_data))
 
 
 class ProductDetailView(PosView):
@@ -95,6 +111,22 @@ class ReceiveView(PosView):
         serializer = ReceiveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         return Response(receive_stock(request.user, serializer.validated_data), status=201)
+
+
+class TransferView(PosView):
+    @extend_schema(tags=["inventory"], request=TransferSerializer)
+    def post(self, request):
+        require(request.user, "inventory.transfer")
+        serializer = TransferSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(transfer_stock(request.user, serializer.validated_data), status=201)
+
+
+class VendorListView(PosView):
+    @extend_schema(tags=["inventory"])
+    def get(self, request):
+        require(request.user, "inventory.receive", "accounting.view", "accounting.pay")
+        return Response(vendor_names())
 
 
 class LocationListView(PosView):
@@ -186,10 +218,13 @@ class CatalogView(PosView):
     @extend_schema(tags=["sales"])
     def get(self, request):
         require(request.user, "sales.sell")
+        serializer = PageQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
         return Response(
             sales_catalog(
                 request.query_params.get("q", ""),
                 request.query_params.get("location", ""),
+                serializer.validated_data["page"],
             )
         )
 
@@ -229,6 +264,22 @@ class ParseSmsView(PosView):
         return Response(parse_payment_sms(serializer.validated_data["text"]))
 
 
+class SaleHistoryView(PosView):
+    @extend_schema(tags=["sales"])
+    def get(self, request):
+        require(request.user, "summary.view")
+        serializer = SaleHistoryQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        return Response(sale_history(serializer.validated_data))
+
+
+class SaleDetailView(PosView):
+    @extend_schema(tags=["sales"])
+    def get(self, request, number):
+        require(request.user, "summary.view")
+        return Response(sale_detail(number))
+
+
 class ReceiptPageView(PosView):
     authentication_classes = []
     permission_classes = [AllowAny]
@@ -249,7 +300,18 @@ class AccountingView(PosView):
             "accounting.profit",
             "accounting.lending",
         )
-        return Response(accounting_overview(request.user))
+        serializer = PeriodQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        return Response(accounting_overview(request.user, serializer.validated_data))
+
+
+class VendorLedgerView(PosView):
+    @extend_schema(tags=["accounting"])
+    def get(self, request, name):
+        require(request.user, "accounting.view", "accounting.pay")
+        serializer = PageQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        return Response(vendor_ledger(name, serializer.validated_data["page"]))
 
 
 class VendorPaymentView(PosView):

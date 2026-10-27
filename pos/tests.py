@@ -287,8 +287,170 @@ class RegisterTests(TestCase):
     def test_admin_capabilities_cover_the_register(self):
         self.assertIn("inventory.receive", self.admin["user"]["capabilities"])
         self.assertIn("sales.sell", self.admin["user"]["capabilities"])
-        self.assertEqual(len(self.admin["user"]["capabilities"]), 12)
+        self.assertEqual(len(self.admin["user"]["capabilities"]), 13)
         self._as(self.admin)
         places = self.client.get("/api/inventory/locations/")
         self.assertEqual({row["name"] for row in places.json()}, {"Warehouse", "Shop"})
         self.assertTrue(Product.objects.filter(barcode="8941100000011").count() == 0)
+
+    def test_transfer_moves_batches_without_counting_as_a_purchase(self):
+        self._receive(location="Warehouse", quantity=10, purchase_rate="40.00")
+        self._as(self.admin)
+        moved = self.client.post(
+            "/api/inventory/transfer/",
+            {
+                "barcode": "8941100000011",
+                "from_location": "Warehouse",
+                "to_location": "Shop",
+                "quantity": 4,
+            },
+            format="json",
+        )
+        self.assertEqual(moved.status_code, 201, moved.content)
+        places = {row["name"]: row["quantity"] for row in moved.json()["locations"]}
+        self.assertEqual(places, {"Shop": 4, "Warehouse": 6})
+        too_many = self.client.post(
+            "/api/inventory/transfer/",
+            {
+                "barcode": "8941100000011",
+                "from_location": "Shop",
+                "to_location": "Warehouse",
+                "quantity": 5,
+            },
+            format="json",
+        )
+        self.assertEqual(too_many.status_code, 400)
+        ledger = self.client.get("/api/accounting/vendors/Agora/")
+        self.assertEqual(ledger.status_code, 200, ledger.content)
+        self.assertEqual(ledger.json()["purchased"], "400.00")
+        self.assertEqual(len(ledger.json()["entries"]), 1)
+
+    def test_card_sale_and_summary_breakdowns(self):
+        self._receive(quantity=3)
+        self._as(self.admin)
+        sale = self.client.post(
+            "/api/sales/checkout/",
+            {
+                "location": "Shop",
+                "lines": [{"barcode": "8941100000011", "quantity": 2}],
+                "payment": {"method": "card", "amount_taken": "200.00"},
+            },
+            format="json",
+        )
+        self.assertEqual(sale.status_code, 201, sale.content)
+        summary = self.client.get("/api/summary/?preset=week").json()
+        self.assertEqual(summary["by_method"][0]["label"], "Card")
+        self.assertEqual(summary["top_products"][0]["quantity"], 2)
+        self.assertEqual(len(summary["by_day"]), 7)
+        self.assertEqual(summary["average"], "200.00")
+        accounting = self.client.get("/api/accounting/?preset=month").json()
+        self.assertEqual(accounting["period"]["sales_total"], "200.00")
+        detail = self.client.get("/api/inventory/products/8941100000011/").json()
+        self.assertEqual(detail["last_receipt"]["origin"], "Agora")
+
+    def test_receipt_contacts_are_optional_but_must_be_valid(self):
+        self._receive(quantity=5)
+        self._as(self.admin)
+
+        def sell(**contact):
+            return self.client.post(
+                "/api/sales/checkout/",
+                {
+                    "location": "Shop",
+                    "lines": [{"barcode": "8941100000011", "quantity": 1}],
+                    "payment": {"method": "cash", "amount_taken": "100.00"},
+                    **contact,
+                },
+                format="json",
+            )
+
+        self.assertEqual(sell().status_code, 201)
+        self.assertEqual(sell(customer_phone="", customer_email="").status_code, 201)
+        bad_phone = sell(customer_phone="017")
+        self.assertEqual(bad_phone.status_code, 400)
+        self.assertIn("mobile number", bad_phone.json()[0])
+        bad_email = sell(customer_email="abc@gmail")
+        self.assertEqual(bad_email.status_code, 400)
+        self.assertIn("full email address", bad_email.json()["customer_email"][0])
+        good = sell(customer_phone="+880 1711-000000")
+        self.assertEqual(good.status_code, 201, good.content)
+        self.assertEqual(good.json()["delivery"]["sms"]["to"], "01711000000")
+        self.assertEqual(StockLot.objects.get().quantity, 2)
+
+    def test_sales_register_pages_filters_and_detail(self):
+        self._receive(quantity=40)
+        self._as(self.admin)
+        numbers = []
+        for index in range(27):
+            method = "card" if index % 3 == 0 else "cash"
+            sale = self.client.post(
+                "/api/sales/checkout/",
+                {
+                    "location": "Shop",
+                    "lines": [{"barcode": "8941100000011", "quantity": 1}],
+                    "payment": {"method": method, "amount_taken": "100.00"},
+                },
+                format="json",
+            )
+            self.assertEqual(sale.status_code, 201, sale.content)
+            numbers.append(sale.json()["number"])
+        first = self.client.get("/api/sales/history/?preset=today").json()
+        self.assertEqual(first["count"], 27)
+        self.assertEqual(first["pages"], 2)
+        self.assertEqual(len(first["results"]), 25)
+        self.assertEqual(first["results"][0]["items"], 1)
+        self.assertEqual(first["sales_total"], "2700.00")
+        second = self.client.get("/api/sales/history/?preset=today&page=2").json()
+        self.assertEqual(len(second["results"]), 2)
+        cards = self.client.get("/api/sales/history/?preset=today&method=card").json()
+        self.assertEqual(cards["count"], 9)
+        found = self.client.get(f"/api/sales/history/?preset=today&q={numbers[4]}").json()
+        self.assertEqual([row["number"] for row in found["results"]], [numbers[4]])
+        self._receive(barcode="8941100000028", name="Bread", quantity=5)
+        mixed = self.client.post(
+            "/api/sales/checkout/",
+            {
+                "location": "Shop",
+                "lines": [{"barcode": "8941100000011", "quantity": 2}, {"barcode": "8941100000028", "quantity": 3}],
+                "payment": {"method": "cash", "amount_taken": "500.00"},
+            },
+            format="json",
+        )
+        self.assertEqual(mixed.status_code, 201, mixed.content)
+        by_product = self.client.get("/api/sales/history/?preset=today&q=bread").json()
+        self.assertEqual(by_product["count"], 1)
+        self.assertEqual(by_product["results"][0]["items"], 5)
+        detail = self.client.get(f"/api/sales/history/{numbers[0]}/")
+        self.assertEqual(detail.status_code, 200, detail.content)
+        self.assertEqual(detail.json()["profit"], "40.00")
+        self.assertIn("<html>", detail.json()["receipt_html"])
+        self.assertEqual(self.client.get("/api/sales/history/NOPE/").status_code, 404)
+
+    def test_product_list_catalog_and_ledger_pages(self):
+        for index in range(23):
+            self._receive(
+                barcode=f"89411000{index:05d}",
+                name=f"Item {index:02d}",
+                quantity=2 if index < 4 else 20,
+                location="Warehouse" if index % 2 else "Shop",
+            )
+        self._as(self.admin)
+        full = self.client.get("/api/inventory/products/").json()
+        self.assertEqual(len(full), 23)
+        first = self.client.get("/api/inventory/products/?page=1").json()
+        self.assertEqual((first["count"], first["pages"], len(first["results"])), (23, 2, 20))
+        self.assertEqual(first["counts"]["low"], 4)
+        second = self.client.get("/api/inventory/products/?page=2").json()
+        self.assertEqual(len(second["results"]), 3)
+        low = self.client.get("/api/inventory/products/?page=1&filter=low").json()
+        self.assertEqual(low["count"], 4)
+        shop = self.client.get("/api/inventory/products/?page=1&location=Shop").json()
+        self.assertEqual(shop["count"], 12)
+        catalog = self.client.get("/api/sales/catalog/?q=Item&location=Shop").json()
+        self.assertEqual((catalog["page"], catalog["pages"], len(catalog["products"])), (1, 2, 20))
+        catalog2 = self.client.get("/api/sales/catalog/?q=Item&location=Shop&page=2").json()
+        self.assertEqual((len(catalog2["products"]), catalog2["bundles"]), (3, []))
+        ledger = self.client.get("/api/accounting/vendors/Agora/").json()
+        self.assertEqual((ledger["count"], ledger["pages"], len(ledger["entries"])), (23, 2, 20))
+        ledger2 = self.client.get("/api/accounting/vendors/Agora/?page=2").json()
+        self.assertEqual(len(ledger2["entries"]), 3)

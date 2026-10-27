@@ -10,7 +10,7 @@ from django.conf import settings
 from django.core.files.base import ContentFile
 from django.core.mail import send_mail
 from django.db import transaction
-from django.db.models import F, Q, Sum
+from django.db.models import Count, F, Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.html import escape
@@ -42,11 +42,13 @@ TXN_RE = re.compile(
     r"(?:TrxID|TxnID|TxnId|Transaction ID|Trx Id)\s*[:#]?\s*([A-Z0-9]+)",
     re.IGNORECASE,
 )
+MOBILE_RE = re.compile(r"^01[3-9]\d{8}$")
 PAYMENT_LABELS = {
     "cash": "Cash",
     "bkash": "bKash",
     "nagad": "Nagad",
     "rocket": "Rocket",
+    "card": "Card",
 }
 
 
@@ -59,6 +61,20 @@ def clean_code(value: str) -> str:
     return code
 
 
+def clean_mobile(value: str) -> str:
+    """Accepts 01XXXXXXXXX, +880/880 prefixes, spaces, and dashes; returns 01XXXXXXXXX."""
+    digits = re.sub(r"[\s-]", "", value or "")
+    if not digits:
+        return ""
+    if digits.startswith("+880"):
+        digits = "0" + digits[4:]
+    elif digits.startswith("880"):
+        digits = "0" + digits[3:]
+    if not MOBILE_RE.match(digits):
+        raise ValidationError("Enter a valid mobile number, like 01712345678, or leave it empty.")
+    return digits
+
+
 def clean_name(value: str, label: str, limit: int = 120) -> str:
     name = " ".join((value or "").split())
     if not name:
@@ -66,6 +82,18 @@ def clean_name(value: str, label: str, limit: int = 120) -> str:
     if len(name) > limit:
         raise ValidationError(f"That {label} is too long.")
     return name
+
+
+PAGE_SIZE = 20
+
+
+def paginate(items, page: int | None, size: int = PAGE_SIZE):
+    """Slice a list or queryset to one page; returns (slice, page metadata)."""
+    count = items.count() if hasattr(items, "count") and not isinstance(items, list) else len(items)
+    pages = max(1, -(-count // size))
+    current = min(max(1, page or 1), pages)
+    offset = (current - 1) * size
+    return items[offset : offset + size], {"count": count, "page": current, "pages": pages}
 
 
 def _image_path(product: Product) -> str | None:
@@ -191,6 +219,26 @@ def product_rows(query: str = "") -> list[dict]:
     return rows
 
 
+PRODUCT_FILTERS = {
+    "low": lambda row: row["low_stock"],
+    "expiring": lambda row: row["expiring"],
+    "combo": lambda row: bool(row["bundle_names"]),
+}
+
+
+def product_page(params: dict) -> dict:
+    rows = product_rows(params.get("q") or "")
+    place = (params.get("location") or "").strip()
+    if place:
+        rows = [row for row in rows if any(spot["name"] == place and spot["quantity"] > 0 for spot in row["locations"])]
+    counts = {"all": len(rows), **{key: sum(1 for row in rows if test(row)) for key, test in PRODUCT_FILTERS.items()}}
+    test = PRODUCT_FILTERS.get(params.get("filter") or "")
+    if test:
+        rows = [row for row in rows if test(row)]
+    results, meta = paginate(rows, params.get("page"))
+    return {**meta, "counts": counts, "results": results}
+
+
 def product_detail(barcode: str) -> dict:
     product = Product.objects.filter(pk=clean_code(barcode)).first()
     if product is None:
@@ -204,6 +252,22 @@ def product_detail(barcode: str) -> dict:
         )
     ]
     summary["lots"] = lots
+    last = (
+        StockMove.objects.filter(product=product, kind="receive")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    summary["last_receipt"] = (
+        {
+            "mrp": paisa_to_taka(last.mrp_paisa),
+            "purchase_rate": paisa_to_taka(last.purchase_paisa),
+            "discount_rate": bps_to_percent(last.discount_bps),
+            "origin": last.origin_id,
+            "location": last.location_id,
+        }
+        if last
+        else None
+    )
     return summary
 
 
@@ -260,6 +324,7 @@ def receive_stock(user, data: dict) -> dict:
             lot.quantity += quantity
             lot.save(update_fields=["quantity"])
         StockMove.objects.create(
+            kind="receive",
             product=product,
             location=location,
             origin=vendor,
@@ -272,6 +337,56 @@ def receive_stock(user, data: dict) -> dict:
             recorded_by=user,
         )
     return product_detail(barcode)
+
+
+def transfer_stock(user, data: dict) -> dict:
+    """Move stock from one place to another, earliest expiry first.
+
+    Each batch keeps its dates, prices, and source; only the place changes.
+    """
+    barcode = clean_code(data["barcode"])
+    quantity = data["quantity"]
+    source = Location.objects.filter(pk=clean_name(data["from_location"], "location", 80)).first()
+    target = Location.objects.filter(pk=clean_name(data["to_location"], "location", 80)).first()
+    if source is None or target is None:
+        raise ValidationError("Choose a warehouse or shop that already exists.")
+    if source.pk == target.pk:
+        raise ValidationError("Choose two different places.")
+    product = Product.objects.filter(pk=barcode).first()
+    if product is None:
+        raise NotFound("That product is not on the register.")
+    with transaction.atomic():
+        for lot, taken in _allocate(product, source, quantity, {}):
+            lot.quantity -= taken
+            lot.save(update_fields=["quantity"])
+            identity = {
+                "product": product,
+                "manufacturing_date": lot.manufacturing_date,
+                "expiry_date": lot.expiry_date,
+                "mrp_paisa": lot.mrp_paisa,
+                "purchase_paisa": lot.purchase_paisa,
+                "discount_bps": lot.discount_bps,
+                "origin_id": lot.origin_id,
+            }
+            moved = StockLot.objects.filter(location=target, **identity).first()
+            if moved is None:
+                StockLot.objects.create(location=target, quantity=taken, **identity)
+            else:
+                moved.quantity += taken
+                moved.save(update_fields=["quantity"])
+            for place, signed in ((source, -taken), (target, taken)):
+                StockMove.objects.create(
+                    kind="transfer",
+                    location=place,
+                    quantity=signed,
+                    recorded_by=user,
+                    **identity,
+                )
+    return product_detail(barcode)
+
+
+def vendor_names() -> list[dict]:
+    return [{"name": vendor.name, "phone": vendor.phone} for vendor in Vendor.objects.all()]
 
 
 def update_preorder(barcode: str, data: dict) -> dict:
@@ -654,7 +769,7 @@ def plan_payload(plan: Plan) -> dict:
     }
 
 
-def catalog(query: str, location_name: str) -> dict:
+def catalog(query: str, location_name: str, page: int = 1) -> dict:
     needle = query.strip()
     location = None
     if location_name:
@@ -663,7 +778,8 @@ def catalog(query: str, location_name: str) -> dict:
     if needle:
         products = products.filter(Q(name__icontains=needle) | Q(barcode__icontains=needle))
     product_rows_out = []
-    for product in products.distinct().order_by("name")[:20]:
+    product_page_rows, meta = paginate(products.distinct().order_by("name"), page)
+    for product in product_page_rows:
         lots = StockLot.objects.filter(product=product, quantity__gt=0)
         if location is not None:
             lots = lots.filter(location=location)
@@ -686,7 +802,8 @@ def catalog(query: str, location_name: str) -> dict:
     if needle:
         bundles = bundles.filter(name__icontains=needle)
     bundle_rows_out = []
-    for bundle in bundles.order_by("name")[:20]:
+    # Combos are few, so they all come with the first page of products.
+    for bundle in bundles.order_by("name") if meta["page"] == 1 else []:
         bundle_rows_out.append(
             {
                 "kind": "bundle",
@@ -698,7 +815,7 @@ def catalog(query: str, location_name: str) -> dict:
                 ],
             }
         )
-    return {"products": product_rows_out, "bundles": bundle_rows_out}
+    return {**meta, "products": product_rows_out, "bundles": bundle_rows_out}
 
 
 def _next_number(today: date) -> str:
@@ -724,6 +841,7 @@ def _apply_moves(sale: Sale, moves: list[tuple[StockLot, int]], user) -> None:
         fresh.quantity -= qty
         fresh.save(update_fields=["quantity"])
         StockMove.objects.create(
+            kind="sale",
             sale=sale,
             product_id=lot.product_id,
             location_id=lot.location_id,
@@ -908,7 +1026,8 @@ def checkout(user, data: dict, request=None) -> dict:
     payment = data["payment"]
     method = payment["method"]
     if method not in PAYMENT_LABELS:
-        raise ValidationError("Choose cash, bKash, Nagad, or Rocket.")
+        raise ValidationError("Choose cash, card, bKash, Nagad, or Rocket.")
+    customer_phone = clean_mobile(data.get("customer_phone") or "")
     with transaction.atomic():
         plan = build_plan(data["location"], data["lines"])
         taken = taka_to_paisa(payment["amount_taken"])
@@ -917,6 +1036,10 @@ def checkout(user, data: dict, request=None) -> dict:
             if taken < plan.total_paisa:
                 raise ValidationError("Cash taken is less than the total.")
             change = taken - plan.total_paisa
+        elif method == "card":
+            if taken != plan.total_paisa:
+                raise ValidationError("The card amount has to match the sale total.")
+            change = 0
         else:
             if not txn:
                 raise ValidationError("Enter the transaction number.")
@@ -934,7 +1057,7 @@ def checkout(user, data: dict, request=None) -> dict:
             amount_taken_paisa=taken,
             change_paisa=change,
             txn_number=txn,
-            customer_phone=(data.get("customer_phone") or "").strip(),
+            customer_phone=customer_phone,
             customer_email=(data.get("customer_email") or "").strip(),
         )
         SaleLine.objects.bulk_create(
@@ -976,12 +1099,14 @@ def _sales_block(start: date, end: date) -> dict:
         total=Coalesce(Sum("total_paisa"), 0),
         cost=Coalesce(Sum("cost_paisa"), 0),
     )
+    count = sales.count()
     return {
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "count": sales.count(),
+        "count": count,
         "sales_total": paisa_to_taka(totals["total"]),
         "profit": paisa_to_taka(totals["total"] - totals["cost"]),
+        "average": paisa_to_taka(totals["total"] // count if count else 0),
         "sales": [
             {
                 "number": sale.number,
@@ -995,9 +1120,9 @@ def _sales_block(start: date, end: date) -> dict:
     }
 
 
-def accounting_overview(user) -> dict:
+def accounting_overview(user, params: dict | None = None) -> dict:
     today = timezone.localdate()
-    payload: dict = {"today": None, "vendors": None, "partners": None, "loans": None}
+    payload: dict = {"today": None, "period": None, "vendors": None, "partners": None, "loans": None}
     if user_can(user, "accounting.view") or user_can(user, "accounting.profit"):
         block = _sales_block(today, today)
         payload["today"] = {
@@ -1006,12 +1131,22 @@ def accounting_overview(user) -> dict:
             "sales_total": block["sales_total"],
             "profit": block["profit"],
         }
+        preset, start, end = period_for(params or {})
+        period = block if preset == "today" else _sales_block(start, end)
+        payload["period"] = {
+            "preset": preset,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "count": period["count"],
+            "sales_total": period["sales_total"],
+            "profit": period["profit"],
+        }
     if user_can(user, "accounting.view") or user_can(user, "accounting.pay"):
         payload["vendors"] = vendor_rows()
     if user_can(user, "accounting.profit"):
         profit_paisa = 0
-        if payload["today"] is not None:
-            profit_paisa = taka_to_paisa(payload["today"]["profit"], allow_negative=True)
+        if payload["period"] is not None:
+            profit_paisa = taka_to_paisa(payload["period"]["profit"], allow_negative=True)
         shares = []
         used = 0
         for partner in ProfitPartner.objects.all():
@@ -1036,7 +1171,7 @@ def accounting_overview(user) -> dict:
 def vendor_rows() -> list[dict]:
     purchased = {
         row["origin_id"]: row["total"] or 0
-        for row in StockMove.objects.filter(quantity__gt=0)
+        for row in StockMove.objects.filter(kind="receive", quantity__gt=0)
         .values("origin_id")
         .annotate(total=Sum(F("quantity") * F("purchase_paisa")))
     }
@@ -1058,6 +1193,60 @@ def vendor_rows() -> list[dict]:
             }
         )
     return rows
+
+
+def vendor_ledger(name: str, page: int = 1) -> dict:
+    vendor = Vendor.objects.filter(pk=name).first()
+    if vendor is None:
+        raise NotFound("That vendor is not on the register.")
+    entries = []
+    receipts = (
+        StockMove.objects.filter(kind="receive", origin=vendor, quantity__gt=0)
+        .select_related("product")
+        .order_by("created_at", "id")
+    )
+    for move in receipts:
+        entries.append(
+            {
+                "kind": "purchase",
+                "date": timezone.localtime(move.created_at).date().isoformat(),
+                "at": move.created_at,
+                "title": f"{move.product.name} × {move.quantity}",
+                "detail": f"{move.location_id} · Exp {move.expiry_date:%d %b %Y}",
+                "paisa": move.purchase_paisa * move.quantity,
+            }
+        )
+    for payment in vendor.payments.order_by("created_at", "id"):
+        entries.append(
+            {
+                "kind": "payment",
+                "date": payment.paid_on.isoformat(),
+                "at": payment.created_at,
+                "title": "Payment",
+                "detail": payment.note,
+                "paisa": payment.amount_paisa,
+            }
+        )
+    entries.sort(key=lambda entry: (entry["date"], entry["at"]))
+    balance = 0
+    rows = []
+    for entry in entries:
+        balance += entry["paisa"] if entry["kind"] == "purchase" else -entry["paisa"]
+        rows.append(
+            {
+                "kind": entry["kind"],
+                "date": entry["date"],
+                "title": entry["title"],
+                "detail": entry["detail"],
+                "amount": paisa_to_taka(entry["paisa"]),
+                "balance": paisa_to_taka(balance),
+            }
+        )
+    rows.reverse()
+    summary = next(row for row in vendor_rows() if row["name"] == vendor.name)
+    summary["entries"], meta = paginate(rows, page)
+    summary.update(meta)
+    return summary
 
 
 def pay_vendor(user, data: dict) -> dict:
@@ -1153,7 +1342,7 @@ def collect_loan(loan_id: int, data: dict) -> dict:
     return next(row for row in loan_rows() if row["id"] == loan.id)
 
 
-def summary_for(params: dict) -> dict:
+def period_for(params: dict) -> tuple[str, date, date]:
     today = timezone.localdate()
     preset = params.get("preset") or "today"
     start = end = today
@@ -1186,8 +1375,147 @@ def summary_for(params: dict) -> dict:
         end = next_month - timedelta(days=1)
     else:
         raise ValidationError("Choose a summary range.")
+    return preset, start, end
+
+
+def _breakdowns(start: date, end: date) -> dict:
+    sales = sales_between(start, end)
+    by_method = [
+        {
+            "method": row["payment_method"],
+            "label": PAYMENT_LABELS.get(row["payment_method"], row["payment_method"]),
+            "count": row["count"],
+            "total": paisa_to_taka(row["total"] or 0),
+        }
+        for row in sales.values("payment_method")
+        .annotate(count=Count("number"), total=Sum("total_paisa"))
+        .order_by("-total")
+    ]
+    days: dict[date, list[int]] = {}
+    if (end - start).days <= 62:
+        cursor = start
+        while cursor <= end:
+            days[cursor] = [0, 0, 0]
+            cursor += timedelta(days=1)
+    for sale in sales.only("created_at", "total_paisa", "cost_paisa"):
+        day = timezone.localtime(sale.created_at).date()
+        bucket = days.setdefault(day, [0, 0, 0])
+        bucket[0] += sale.total_paisa
+        bucket[1] += sale.total_paisa - sale.cost_paisa
+        bucket[2] += 1
+    by_day = [
+        {
+            "date": day.isoformat(),
+            "total": paisa_to_taka(values[0]),
+            "profit": paisa_to_taka(values[1]),
+            "count": values[2],
+        }
+        for day, values in sorted(days.items())
+    ]
+    top_products = [
+        {
+            "name": row["name"],
+            "kind": row["kind"],
+            "quantity": row["quantity"],
+            "total": paisa_to_taka(row["total"] or 0),
+        }
+        for row in SaleLine.objects.filter(sale__in=sales)
+        .values("name", "kind")
+        .annotate(quantity=Sum("quantity"), total=Sum("line_total_paisa"))
+        .order_by("-total")[:25]
+    ]
+    return {"by_method": by_method, "by_day": by_day, "top_products": top_products}
+
+
+HISTORY_PAGE_SIZE = 25
+
+
+def sale_history(params: dict) -> dict:
+    """Every sale in the chosen period, newest first, a page at a time."""
+    preset, start, end = period_for(params)
+    sales = sales_between(start, end).select_related("cashier")
+    method = (params.get("method") or "").strip()
+    if method:
+        sales = sales.filter(payment_method=method)
+    needle = (params.get("q") or "").strip()
+    if needle:
+        sales = sales.filter(
+            Q(number__icontains=needle)
+            | Q(txn_number__icontains=needle)
+            | Q(customer_phone__icontains=needle)
+            | Q(number__in=SaleLine.objects.filter(name__icontains=needle).values("sale_id"))
+        )
+    totals = sales.aggregate(total=Coalesce(Sum("total_paisa"), 0), cost=Coalesce(Sum("cost_paisa"), 0))
+    rows, meta = paginate(
+        sales.order_by("-created_at").annotate(items=Coalesce(Sum("lines__quantity"), 0)),
+        params.get("page"),
+        HISTORY_PAGE_SIZE,
+    )
+    return {
+        "preset": preset,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        **meta,
+        "sales_total": paisa_to_taka(totals["total"]),
+        "profit": paisa_to_taka(totals["total"] - totals["cost"]),
+        "results": [
+            {
+                "number": sale.number,
+                "created_at": timezone.localtime(sale.created_at).isoformat(),
+                "total": paisa_to_taka(sale.total_paisa),
+                "profit": paisa_to_taka(sale.total_paisa - sale.cost_paisa),
+                "payment_method": sale.payment_method,
+                "location": sale.location_id,
+                "items": sale.items,
+                "cashier": (sale.cashier.get_full_name() or sale.cashier.email) if sale.cashier_id else "",
+                "customer_phone": sale.customer_phone,
+            }
+            for sale in rows
+        ],
+    }
+
+
+def sale_detail(number: str) -> dict:
+    sale = Sale.objects.select_related("cashier").prefetch_related("lines", "notices").filter(pk=number).first()
+    if sale is None:
+        raise NotFound("That sale is not on the register.")
+    payload = sale_payload(sale)
+    payload.update(
+        {
+            "cost": paisa_to_taka(sale.cost_paisa),
+            "profit": paisa_to_taka(sale.total_paisa - sale.cost_paisa),
+            "cashier": (sale.cashier.get_full_name() or sale.cashier.email) if sale.cashier_id else "",
+            "customer_phone": sale.customer_phone,
+            "customer_email": sale.customer_email,
+            "notices": [
+                {
+                    "channel": notice.channel,
+                    "destination": notice.destination,
+                    "created_at": timezone.localtime(notice.created_at).isoformat(),
+                }
+                for notice in sale.notices.all()
+            ],
+        }
+    )
+    return payload
+
+
+def summary_for(params: dict) -> dict:
+    preset, start, end = period_for(params)
     block = _sales_block(start, end)
     block["preset"] = preset
+    block.update(_breakdowns(start, end))
+    rows = product_rows()
+    block["expiring"] = [
+        {
+            "barcode": row["barcode"],
+            "name": row["name"],
+            "quantity": row["quantity"],
+            "soonest_expiry": row["soonest_expiry"],
+        }
+        for row in rows
+        if row["expiring"] and row["quantity"] > 0
+    ]
     block["depleted"] = [
         {
             "barcode": row["barcode"],
@@ -1196,7 +1524,7 @@ def summary_for(params: dict) -> dict:
             "reorder_level": row["preorder"]["reorder_level"],
             "locations": row["locations"],
         }
-        for row in product_rows()
+        for row in rows
         if row["low_stock"]
     ]
     return block
